@@ -1,0 +1,128 @@
+name: Build mod
+on:
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "Имя zip-файла проекта в корне репозитория"
+        required: true
+        default: "railgrip-forge-1.12.2.zip"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Серверы скачивания иногда отвечают 504, поэтому у каждой Java есть запасные источники.
+
+      # 1) Java 8 — для компиляции мода под Forge 1.12.2
+      - name: Java 8 (Temurin)
+        id: j8a
+        continue-on-error: true
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 8
+      - name: Java 8 (Zulu, запасной)
+        id: j8b
+        if: steps.j8a.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 8
+      - name: Java 8 (Corretto, запасной)
+        if: steps.j8a.outcome == 'failure' && steps.j8b.outcome == 'failure'
+        uses: actions/setup-java@v5
+        with:
+          distribution: corretto
+          java-version: 8
+
+      # 2) Java 25 — на ней запускается сам Gradle 9.5.0 (плагин RetroFuturaGradle собран под Java 25)
+      - name: Java 25 (Temurin)
+        id: j25a
+        continue-on-error: true
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 25
+      - name: Java 25 (Zulu, запасной)
+        if: steps.j25a.outcome == 'failure'
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 25
+
+      # Gradle скачиваем сами: сначала 9.5.0 с нескольких зеркал; если все недоступны —
+      # запасные версии 9.4.1 / 9.3.1 (проект с ними тоже собирается)
+      - name: Install Gradle
+        run: |
+          mkdir -p "$HOME/gradle-dist" && cd "$HOME/gradle-dist"
+          used=""
+          for V in 9.5.0 9.4.1 9.3.1; do
+            for url in \
+              "https://services.gradle.org/distributions/gradle-$V-bin.zip" \
+              "https://github.com/gradle/gradle-distributions/releases/download/v$V/gradle-$V-bin.zip" \
+              "https://mirrors.cloud.tencent.com/gradle/gradle-$V-bin.zip" \
+              "https://repo.huaweicloud.com/gradle/gradle-$V-bin.zip"; do
+              for i in 1 2; do
+                echo "[$V] попытка $i: $url"
+                rm -f gradle.zip
+                if curl -fsSL --connect-timeout 20 --max-time 300 -o gradle.zip "$url" && unzip -tq gradle.zip > /dev/null 2>&1; then
+                  used="$V"; break 3
+                fi
+                sleep 4
+              done
+            done
+          done
+          if [ -z "$used" ]; then echo "Не удалось скачать Gradle ни с одного зеркала"; exit 1; fi
+          echo "Скачан Gradle $used"
+          unzip -q gradle.zip
+          echo "$HOME/gradle-dist/gradle-$used/bin" >> "$GITHUB_PATH"
+
+      - name: Unzip project
+        run: |
+          ls -la
+          mkdir -p proj
+          unzip -oq "${{ github.event.inputs.zip }}" -d proj
+          find proj -maxdepth 3 -name "*.gradle" -o -maxdepth 3 -name "gradle.properties"
+
+      - name: Prepare project
+        run: |
+          DIR=$(dirname "$(find proj -name build.gradle | head -1)")
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          cd "$DIR"
+          # плагин авто-поиска Java не нужен: Java 8 уже поставлена шагом выше
+          sed -i "/foojay-resolver-convention/d" settings.gradle
+          echo "---- settings.gradle ----"; cat settings.gradle
+          echo "---- gradle.properties ----"; cat gradle.properties
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "JAVA_HOME_8_X64=$JAVA_HOME_8_X64"
+          java -version
+
+      - name: Build
+        run: |
+          cd "$PROJECT_DIR"
+          gradle --version
+          gradle build --no-daemon --stacktrace \
+            -Dorg.gradle.java.installations.paths="$JAVA_HOME_8_X64" \
+            -Dorg.gradle.java.installations.auto-detect=false
+
+      - name: Upload mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: mod-jar
+          path: |
+            proj/**/build/libs/*.jar
+            !proj/**/build/libs/*-dev.jar
+            !proj/**/build/libs/*-sources.jar
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            proj/**/build/reports/**
+          if-no-files-found: ignore
